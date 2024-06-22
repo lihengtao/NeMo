@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import tempfile
 from typing import List, Optional, Union
 
 import torch
@@ -135,6 +137,60 @@ class MultimodalAdapterModelMixin(NLPAdapterModelMixin):
             raise RuntimeError(f"{filepath} is not nemo file or ckpt file")
         if not self.ptuning_only_and_non_first_stage:
             assert set(state_dict.keys()) == self.adapter_keys.union(self.tunable_base_param_keys)
+        if self.cfg.megatron_amp_O2:
+            state_dict = {replace_prefix(k, 'model.', 'model.module.'): v for k, v in state_dict.items()}
+
+        missing_keys, unexpected_keys = NLPModel.load_state_dict(self, state_dict, strict=False)
+
+        if len(missing_keys) > 0:
+            logging.warning('Missing keys were detected during the load. Please double check.')
+            if len(missing_keys) > 10:
+                logging.warning(f'Missing keys: {missing_keys[:10]} and {len(missing_keys) - 10} more.')
+            else:
+                logging.warning(f'Missing keys: {missing_keys}')
+        if len(unexpected_keys) > 0:
+            logging.critical('Unexpected keys were detected during the load. Please double check.')
+            logging.critical(f'Unexpected keys: \n{unexpected_keys}')
+            raise ValueError('Unexpected keys were detected during the load. Please double check.')
+
+    def load_mm_adapters(
+        self,
+        filepath: str,
+        map_location: str = None,
+    ):
+        """
+        Utility method that restores only the adapter module(s), and not the entire model itself.
+        This allows the sharing of adapters which are often just a fraction of the size of the full model,
+        enabling easier deliver.
+
+        .. note::
+
+            During restoration, assumes that the model does not currently already have one or more adapter modules.
+
+        Args:
+            filepath: Filepath of the .ckpt or .nemo file.
+            map_location: Pytorch flag, where to place the adapter(s) state dict(s).
+        """
+
+        # Determine device
+        if map_location is None:
+            if torch.cuda.is_available():
+                map_location = 'cuda'
+            else:
+                map_location = 'cpu'
+
+        if filepath.endswith('.nemo'):
+            sharded_state_dict = None
+            if getattr(self, "sharded_state_dict", None) is not None:
+                sharded_state_dict = self.sharded_state_dict(prefix="model.")
+            if sharded_state_dict:
+                prefix = 'model.embedding.word_embeddings.adapter_layer'
+                sharded_state_dict = {k: v for k, v in sharded_state_dict.items() if k.startswith(prefix)}
+            conf, state_dict = self._get_config_and_state_dict_from_nemo(filepath, map_location, sharded_state_dict)
+        elif filepath.endswith('.ckpt'):
+            state_dict = torch.load(filepath, map_location)['state_dict']
+        else:
+            raise RuntimeError(f"{filepath} is not nemo file or ckpt file")
         if self.cfg.megatron_amp_O2:
             state_dict = {replace_prefix(k, 'model.', 'model.module.'): v for k, v in state_dict.items()}
 

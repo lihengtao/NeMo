@@ -35,6 +35,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 )
 from nemo.core.classes.mixins import adapter_mixin_strategies
 from nemo.core.classes.mixins.adapter_mixins import AdapterConfig
+from einops import rearrange, repeat
 
 try:
     from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
@@ -929,16 +930,8 @@ class MultimodalProjectorAdapter(nn.Module, AdapterModuleUtil):
             self.mm_projector = torch.nn.Linear(in_features, out_features, bias)
         elif adapter_type == 'identity':
             self.mm_projector = lambda x: x
-        elif adapter_type == 'mlp_downsample':
-            self.mm_projector = torch.nn.Sequential(
-                DownSampleBlock(),
-                torch.nn.LayerNorm(in_features * 4),
-                torch.nn.Linear(in_features * 4, out_features, bias),
-                torch.nn.GELU(),
-                torch.nn.Linear(out_features, out_features, bias),
-            )
         else:
-            mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', adapter_type)
+            mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu', adapter_type)
             if mlp_gelu_match:
                 mlp_depth = int(mlp_gelu_match.group(1))
                 modules = [torch.nn.Linear(in_features, out_features, bias)]
@@ -946,11 +939,27 @@ class MultimodalProjectorAdapter(nn.Module, AdapterModuleUtil):
                     modules.append(torch.nn.GELU())
                     modules.append(torch.nn.Linear(out_features, out_features, bias))
                 self.mm_projector = torch.nn.Sequential(*modules)
+                if adapter_type.endswith('downsample'):
+                    self.downsample = nn.Conv2d(
+                        in_channels=in_features,
+                        out_channels=in_features,
+                        kernel_size=3,
+                        stride=2,
+                        bias=bias,
+                        padding=1,
+                    )
+                    self.alpha = nn.Parameter(torch.tensor(0.))
             else:
                 raise ValueError(f'Unknown mm_mlp_adapter_type type: {adapter_type}')
 
     def forward(self, x):
-        return self.mm_projector(x)
+        sml_images, sub_images = x
+        if hasattr(self, 'downsample'):
+            sub_images = self.downsample(sub_images)
+            sub_images = rearrange(sub_images, "b d h w -> b (h w) d")
+            return self.mm_projector(sml_images + self.alpha * sub_images)
+        else:
+            return self.mm_projector(sml_images)
 
 
 @dataclass

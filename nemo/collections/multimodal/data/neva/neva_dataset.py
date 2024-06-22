@@ -27,7 +27,7 @@ import torch.nn.functional as F
 import transformers
 from einops import rearrange
 from omegaconf import DictConfig
-from PIL import Image
+from PIL import Image, ImageFile, UnidentifiedImageError
 from torch.utils.data import Dataset, default_collate
 from transformers import CLIPImageProcessor, SiglipImageProcessor
 
@@ -54,6 +54,29 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+
+# 数据集中有些图像分辨率很大，默认的上限会在load时报Error
+# 例如combined_images/ureader_images/InfographicsVQA/pngs/39041.png
+Image.MAX_IMAGE_PIXELS = 2800000000
+ImageFile.LOAD_TRUNCATED_IMAGES=True
+
+
+def safe_image_load(path):
+    try:
+        with Image.open(path) as img:
+            return img.convert('RGB')
+    except UnidentifiedImageError:
+        print(f"Cannot identify image file {path}. It may be corrupted or in an unsupported format.")
+        return None
+    except FileNotFoundError:
+        print(f"No such file: {path}. Please check the file path.")
+        return None
+    except OSError:
+        print(f"OSError: {path}.")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None
 
 
 class TarOrFolderImageLoader:
@@ -94,10 +117,10 @@ class TarOrFolderImageLoader:
                 member = self.tar_index.get(file_name)
                 if member:
                     f = tar.extractfile(member)
-                    return Image.open(f).convert('RGB')
+                    return safe_image_load(f)
         else:
-            return Image.open(os.path.join(self.image_folder, file_name)).convert('RGB')
-        return None
+            image_path = os.path.join(self.image_folder, file_name)
+            return safe_image_load(image_path)
 
 
 class TarOrFolderVideoLoader:
@@ -215,7 +238,7 @@ def tokenize(
     max_len = max([len(token) for token in tokens])
     context_length = min(max_len - add_extra_token, context_length)
     # truncate and padding
-    result = torch.zeros(len(tokens), context_length + add_extra_token, dtype=torch.long)
+    result = torch.ones(len(tokens), context_length + add_extra_token, dtype=torch.long) * tokenizer.pad_id
 
     for i, token in enumerate(tokens):
         if len(token) > context_length + add_extra_token:
@@ -278,13 +301,8 @@ def preprocess_multimodal(sources: dict, multimodal_cfg: dict, cur_token_len: in
         if multimodal_cfg['sep_image_conv_front']:
             assert default_token in conversation[0]['value']
             conversation[0]['value'] = conversation[0]['value'].replace(default_token, '').strip()
-            conversation[0]['value'] = (
-                default_token
-                + conversation_lib.default_conversation.sep
-                + conversation_lib.default_conversation.roles[0]
-                + ": "
-                + conversation[0]['value']
-            )
+            conversation[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + conversation[0]['value']
+            conversation[0]['value'] = conversation[0]['value'].strip()
         if use_plain:
             assert default_token in conversation[0]['value']
             conversation[0]['value'] = default_token
@@ -601,6 +619,10 @@ def preprocess_v1(
     else:
         labels = torch.roll(labels, shifts=-1, dims=-1)
         labels[:, -1] = IGNORE_INDEX
+    
+    # 对齐xtuner时使用下面的代码
+    # labels = torch.roll(labels, shifts=-1, dims=-1)
+    # labels[:, -1] = IGNORE_INDEX
 
     return dict(
         tokens=tokens,
@@ -918,12 +940,22 @@ class LazySupervisedDataset(Dataset):
     def __len__(self):
         return len(self.list_data_dict)
 
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len if 'image' in sample and sample['image'] else -cur_len
+            length_list.append(cur_len)
+        return length_list
+
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        if 'image' in sources[0]:
+        if 'image' in sources[0] and sources[0]['image']:
             if not isinstance(self.list_data_dict[i]['image'], list):
                 self.list_data_dict[i]['image'] = [self.list_data_dict[i]['image']]
 
@@ -1128,6 +1160,51 @@ class NevaDataset(LazySupervisedDataset):
         else:
             raise ValueError(f"Formatting of {data_path} is not supported in Neva.")
 
+        filtered_list = []
+        # filter missing files, for llava 655k sft data
+        for idx, item in enumerate(self.list_data_dict):
+            if 'image' in item.keys() and item['image'] and not os.path.exists(os.path.join(self.image_folder, item['image'])):
+                with open('image_missing_file.txt', 'a') as f:
+                    f.write(item['image'])
+                    f.write('\n')
+                    logging.warning(f"Missing image: {item['image']}")
+            else:
+                image_tag_nums = 0
+                for conv in item['conversations']:
+                    image_tag_nums += conv['value'].count('<image>')
+                if image_tag_nums > 1:
+                    logging.warning(f"Skip image for wrong image token nums: {item['image']}")
+                else:
+                    filtered_list.append(item)
+        
+        if multimodal_cfg['datasets_exclude']:
+            include_datasets = set()
+            exclude_datasets = set()
+            for idx, item in enumerate(self.list_data_dict):
+                # filter excluded datasets
+                if item['dataset'] in multimodal_cfg['datasets_exclude']:
+                    exclude_datasets.add(item['dataset'])
+                else:
+                    include_datasets.add(item['dataset'])
+                    filtered_list.append(item)
+            logging.warning("Include datasets:")
+            logging.warning(sorted(include_datasets))
+            logging.warning("Exclude datasets:")
+            logging.warning(sorted(exclude_datasets))
+            self.list_data_dict = filtered_list
+        
+        if self.list_data_dict and 'dataset' in self.list_data_dict[0].keys():
+            # llava数据集没有dataset字段，自定义数据集有
+            dataset_sample_num = {}
+            for data in self.list_data_dict:
+                dataset = data['dataset']
+                if dataset not in dataset_sample_num:
+                    dataset_sample_num[dataset] = 0
+                dataset_sample_num[dataset] += 1
+            for dataset, num in sorted(dataset_sample_num.items()):
+                logging.warning(f'{dataset}: {num}')
+        
+
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
@@ -1137,12 +1214,16 @@ class DataCollatorForSupervisedDataset(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        if None in instances:
+            return None
+        tokenizer = self.tokenizer
+        model_cfg = self.model_cfg
         packed_sequence = "cu_seqlens" in instances[0]
         max_len = max(instance['tokens'].shape[0] for instance in instances)
         max_len = (max_len - 1) // 64 * 64 + 64
         for instance in instances:
             pad_len = max_len - instance['tokens'].shape[0]
-            instance['tokens'] = F.pad(instance['tokens'], (0, pad_len), 'constant', 0)
+            instance['tokens'] = F.pad(instance['tokens'], (0, pad_len), 'constant', tokenizer.pad_id)
             instance['labels'] = F.pad(instance['labels'], (0, pad_len), 'constant', -1)
             if packed_sequence and instance["cu_seqlens"][-1] != max_len:
                 instance["cu_seqlens"] = torch.cat((instance["cu_seqlens"], torch.IntTensor([max_len])), 0)
@@ -1160,8 +1241,6 @@ class DataCollatorForSupervisedDataset(object):
                 instance['image'] = torch.cat((x, pad_tensor), dim=0)
 
         batch = default_collate(instances)
-        tokenizer = self.tokenizer
-        model_cfg = self.model_cfg
 
         tokens = batch['tokens']
         labels = batch['labels']
@@ -1244,6 +1323,7 @@ def make_supervised_data_module(tokenizer, image_processor, model_cfg) -> Dict:
             image_processor=image_processor,
             add_extra_token=add_extra_token,
             context_length=model_cfg.encoder_seq_length,
+            datasets_exclude=data_cfg.get('datasets_exclude', []),
             media_type=data_cfg.get('media_type', 'image'),
             num_frames=data_cfg.get('num_frames', -1),
             mm_mlp_adapter_type=model_cfg.mm_cfg.get('mm_mlp_adapter_type', 'linear'),
@@ -1276,3 +1356,19 @@ class NevaPackedSeqDatatset(Dataset):
         }
 
         return batch
+
+
+class NevaDataloader(torch.utils.data.DataLoader):
+    def __iter__(self):
+        # Create an iterator from the original DataLoader
+        batch_iterator = super().__iter__()
+
+        # Define a generator to filter out batches
+        def filter_batches():
+            for batch in batch_iterator:
+                try:
+                    yield batch
+                except Exception as e:
+                    logging.warning(f"Exception occurred: {type(e).__name__}: {e}")
+
+        return filter_batches()

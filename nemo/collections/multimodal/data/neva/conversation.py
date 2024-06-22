@@ -82,6 +82,19 @@ class Conversation:
                     ret += role + ": " + message + self.sep
                 else:
                     ret += role + ":"
+        # elif self.sep_style == SeparatorStyle.TWO:
+        #     seps = [self.sep, self.sep2]
+        #     ret = self.system + seps[0]
+        #     for i, (role, message) in enumerate(messages):
+        #         if message:
+        #             if type(message) is tuple:
+        #                 message, _, _ = message
+        #             ret += role + ": " + message + seps[i % 2]
+        #             if i % 2 == 1 and i != len(messages) - 1:  # Assistant end
+        #                 ret += " "
+        #         else:
+        #             ret += role + ":"
+        # align xtuner
         elif self.sep_style == SeparatorStyle.TWO:
             seps = [self.sep, self.sep2]
             ret = self.system + seps[0]
@@ -90,8 +103,10 @@ class Conversation:
                     if type(message) is tuple:
                         message, _, _ = message
                     ret += role + ": " + message + seps[i % 2]
-                    if i % 2 == 1 and i != len(messages) - 1:  # Assistant end
-                        ret += " "
+                    if i % 2 == 1:  # Assistant end
+                        ret += '\n'
+                        if i != len(messages) - 1:
+                            ret += DEFAULT_BOS_TOKEN
                 else:
                     ret += role + ":"
         elif self.sep_style == SeparatorStyle.LLAMA_2:

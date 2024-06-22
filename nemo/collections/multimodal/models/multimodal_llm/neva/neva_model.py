@@ -31,6 +31,7 @@ from nemo.collections.multimodal.data.neva.neva_dataset import (
     DataCollatorForSupervisedDataset,
     NevaPackedSeqDatatset,
     make_supervised_data_module,
+    NevaDataloader
 )
 from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron_clip_models import (
     CLIPVisionTransformer,
@@ -45,10 +46,7 @@ from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters imp
     AdapterName,
     MultimodalProjectorAdapterConfig,
 )
-from nemo.collections.nlp.modules.common.megatron.utils import (
-    average_losses_across_data_parallel_group,
-    get_iterator_k_split,
-)
+from nemo.collections.nlp.modules.common.megatron.utils import average_losses_across_data_parallel_group
 from nemo.collections.nlp.modules.common.text_generation_utils import (
     generate,
     get_computeprob_response,
@@ -59,7 +57,10 @@ from nemo.collections.nlp.modules.common.text_generation_utils import (
 from nemo.collections.nlp.modules.common.transformer.text_generation import LengthParam, OutputType, SamplingParam
 from nemo.collections.nlp.parts.mixins.multimodal_adapter_mixins import MultimodalAdapterModelMixin
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
-from nemo.collections.vision.data.megatron.data_samplers import MegatronVisionPretrainingRandomSampler
+from nemo.collections.vision.data.megatron.data_samplers import (
+    MegatronVisionPretrainingRandomSampler,
+    MegatronModalityPretrainingRandomSampler
+)
 from nemo.core import adapter_mixins
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
@@ -109,7 +110,7 @@ class FrozenCLIPVisionTransformer(CLIPVisionTransformer):
         return self
 
     def forward(self, input):
-        assert self.training == False
+        # assert self.training == False
         hidden_states = self.backbone(input)
         # Do not add header after backbone
         return hidden_states
@@ -139,9 +140,10 @@ class NevaWordEmbeddingMixin(torch.nn.Module, adapter_mixins.AdapterModuleMixin)
         vision_select_layer=-1,
         class_token_length=1,
         use_im_start_end=False,
+        use_image_tile=False,
     ):
         self.vision_encoder = vision_encoder
-        self.from_hf = isinstance(vision_encoder, CLIPVisionModel) or isinstance(vision_encoder, SiglipVisionModel)
+        self.from_hf = not isinstance(vision_encoder, MegatronCLIPModel)
         self.media_start_id = media_start_id
         self.media_end_id = media_end_id
         self.class_token_length = class_token_length
@@ -149,6 +151,7 @@ class NevaWordEmbeddingMixin(torch.nn.Module, adapter_mixins.AdapterModuleMixin)
         self.vision_select_layer = vision_select_layer
         self.media = None
         self.set_accepted_adapter_types([MultimodalProjectorAdapterConfig._target_])
+        self.use_image_tile = use_image_tile
 
     def set_media(self, media):
         self.media = media
@@ -172,24 +175,44 @@ class NevaWordEmbeddingMixin(torch.nn.Module, adapter_mixins.AdapterModuleMixin)
         """
 
         assert vision_x.ndim == 6, "vision_x should be of shape (b, T_img, F, C, H, W)"
-        b, T, F = vision_x.shape[:3]
+        b, T, F, C, H, W = vision_x.shape
+        h = w = H // 2
+
+        assert F == 1, "Only single frame supported"
+        assert T == 1, "Only single frame supported"
 
         vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
-        vision_x = vision_x.to(self.vision_encoder.dtype)
-        with torch.no_grad():
-            if self.from_hf:
-                vision_x = self.vision_encoder(vision_x, output_hidden_states=True)
-                vision_x = vision_x.hidden_states[self.vision_select_layer]
-            else:
-                self.vision_encoder.backbone.transformer.return_select_layer = self.vision_select_layer
-                vision_x = self.vision_encoder(vision_x)
-        vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
-        vision_x = vision_x[:, :, :, self.class_token_length :]
-        assert self.is_adapter_available(), "Cannot find multimodal vision adapter!"
-        vision_connector = self.get_adapter_module(AdapterName.MULTIMODAL_PROJECTOR_ADAPTER)
-        vision_x = vision_connector(vision_x)
-        return vision_x
+        vision_x = vision_x.to(torch.bfloat16)
+        
+        if self.use_image_tile:
+            sml_images = torch.nn.functional.interpolate(vision_x, size=(h, w), mode='bicubic')
+            sub_images = rearrange(vision_x, "b c (hs h) (ws w) -> (b hs ws) c h w", hs=2, ws=2)
+            images = torch.cat([sml_images,sub_images])
 
+            images = self.vision_encoder(images, output_hidden_states=True)
+            images = images.hidden_states[self.vision_select_layer]
+            images = images[:, self.class_token_length :]
+            sml_images, sub_images = images[:b], images[b:]
+
+            P = int(sml_images.shape[1] ** 0.5)
+            sub_images = rearrange(sub_images, "(b hs ws) (h w) c -> b c (hs h) (ws w)", hs=2, ws=2, h=P, w=P)
+
+            assert self.is_adapter_available(), "Cannot find multimodal vision adapter!"
+            vision_connector = self.get_adapter_module(AdapterName.MULTIMODAL_PROJECTOR_ADAPTER)
+            vision_x = vision_connector([sml_images, sub_images])
+            vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
+        else:
+            vision_x = self.vision_encoder(vision_x, output_hidden_states=True)
+            vision_x = vision_x.hidden_states[self.vision_select_layer]
+            vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
+            vision_x = vision_x[:, :, :, self.class_token_length :]
+
+            assert self.is_adapter_available(), "Cannot find multimodal vision adapter!"
+            vision_connector = self.get_adapter_module(AdapterName.MULTIMODAL_PROJECTOR_ADAPTER)
+            vision_x = vision_connector([vision_x[:, 0, 0], None])[:, None, None, ...]
+
+        return vision_x
+    
     def replace_media_embeddings(self, input_ids, inputs_embeds, media):
         if media is None:
             return inputs_embeds
@@ -406,12 +429,12 @@ class NevaBaseModel:
         )
 
         if 'model.language_model.output_layer.weight' in state_dict:
+            state_dict['model.language_model.output_layer.weight'] = F.pad(
+                state_dict['model.language_model.output_layer.weight'], (0, 0, 0, pad_length)
+            )
             assert (
                 state_dict['model.language_model.embedding.word_embeddings.weight'].shape
                 == state_dict['model.language_model.output_layer.weight'].shape
-            )
-            state_dict['model.language_model.output_layer.weight'] = F.pad(
-                state_dict['model.language_model.output_layer.weight'], (0, 0, 0, pad_length)
             )
         return state_dict
 
@@ -524,6 +547,9 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                 autocast_dtype=self.autocast_dtype if self.megatron_amp_O2 else None,
             )
         self.adapter_keys = self._get_all_keys() - self.base_keys
+        print(f'Loading pretrained adpater from {self.cfg.mm_cfg.pretrain_mm_mlp_adapter}')
+        if self.cfg.mm_cfg.pretrain_mm_mlp_adapter:
+            self.load_mm_adapters(self.cfg.mm_cfg.pretrain_mm_mlp_adapter)
         if self.megatron_amp_O2:
             self.adapter_keys = set(key.replace("model.module.", "model.", 1) for key in self.adapter_keys)
 
@@ -653,6 +679,30 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
             params_with_grad = [param for param in param_group['params'] if param.requires_grad]
             param_group['params'] = params_with_grad
 
+        if not self.cfg.mm_cfg.vision_encoder.freeze:
+            param_to_name = {
+                param: name
+                for name, param in self.model.named_parameters()
+            }
+            vision_encoder_params = []
+            base_lr = self._cfg.optim.get('lr')
+            for param_group in self._optimizer_param_groups:
+                params = []
+                for param in param_group['params']:
+                    param_name = param_to_name.get(param)
+                    if 'vision_encoder' in param_name:
+                        vision_encoder_params.append(param)
+                    else:
+                        params.append(param)
+                param_group['params'] = params
+                param_group['lr'] = base_lr
+            vision_encoder_lr_ratio = self.cfg.mm_cfg.vision_encoder.vision_encoder_lr_ratio
+            self._optimizer_param_groups = list(self._optimizer_param_groups)
+            self._optimizer_param_groups.append({
+                'params': vision_encoder_params,
+                'lr': base_lr * vision_encoder_lr_ratio
+            })
+
         # set projection matrix and lora to two param groups with different LR
         if self.use_peft:
             assert len(self._optimizer_param_groups) == 1
@@ -772,7 +822,10 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
         The input batch to each micro-batch is fetched using the dataloader function
         in the micro-batch fwd function.
         """
-        return MegatronGPTModel.training_step(self, dataloader_iter)
+        loss = MegatronGPTModel.training_step(self, dataloader_iter)
+        if loss.isnan().any():
+            loss = None
+        return loss
 
     def get_forward_output_and_loss_func(self, validation_step=False, tuning=False):
         def loss_func(output_tensor, loss_mask):
@@ -784,9 +837,9 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                 return loss_for_ub, dict(avg=reduced_loss[0].unsqueeze(0))
 
         def fwd_output_and_loss_func(dataloader_iter, model, checkpoint_activations_all_layers=None):
-            batch = next(dataloader_iter)
+            batch, _, _ = next(dataloader_iter)
             if isinstance(batch, tuple):
-                batch = batch[0]
+                batch = batch
             if parallel_state.get_pipeline_model_parallel_world_size() == 1:
                 for k in batch.keys():
                     if self.get_attention_mask_from_fusion:
@@ -869,6 +922,19 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
             return output_tensor, partial(loss_func, loss_mask=batch.get('loss_mask'))
 
         return fwd_output_and_loss_func
+    
+    def on_after_backward(self):
+        nan_grads = False
+        for name, params in self.named_parameters():
+            if params.grad is not None:
+                if torch.isnan(params.grad).any():
+                    nan_grads = True
+                    break
+        if nan_grads:
+            print("NaN detected in gradients. Saving inputs and model parameters...")
+            torch.save(self.current_batch, 'inputs_with_nan_grads.pt')
+            torch.save(self.state_dict(), 'model_with_nan_grads.pt')
+            self.trainer.should_stop = True  # stop training
 
     def get_forward_output_only_func(self):
         def fwd_output_only_func(dataloader_iter, model):
@@ -967,13 +1033,19 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
 
     def loss_func(self, loss_mask, output_tensor):
         losses = output_tensor.float()
+        if (loss_mask.sum(dim=1) == 0).all():
+            logging.warning('*' * 40 + 'loss_mask all zeros' + '*' * 40)
+            loss_mask = torch.ones_like(losses).bool()
+            ratio = 0.
+        else:
+            ratio = 1.
         loss_mask = loss_mask.view(-1).float()
         # TODO: add nemo version here
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()  # sequence level nll
+        loss = ratio * torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()  # sequence level nll
         return loss
 
     def setup(self, stage=None):
-        """PTL hook that is executed after DDP spawns.
+        """ PTL hook that is executed after DDP spawns.
             We setup datasets here as megatron datasets require DDP to instantiate.
             See https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#setup for more information.
         Args:
@@ -1101,13 +1173,30 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                     drop_last=self.cfg.get('drop_last', True),
                     data_sharding=False,
                 )
+            elif self.cfg.data.dataloader_type == 'modality':
+                lengths = dataset.modality_lengths
+                batch_sampler = MegatronModalityPretrainingRandomSampler(
+                    dataset=dataset,
+                    total_samples=len(dataset),
+                    consumed_samples=consumed_samples,
+                    micro_batch_size=micro_batch_size,
+                    data_parallel_rank=parallel_state.get_data_parallel_rank(),
+                    data_parallel_size=parallel_state.get_data_parallel_world_size(),
+                    drop_last=self.cfg.get('drop_last', True),
+                    mega_batch_mult=self.cfg.get('mega_batch_mult', 1),
+                    data_sharding=False,
+                    lengths=lengths,
+                    global_batch_size=self.cfg.global_batch_size,
+                )
+            elif self.cfg.data.dataloader_type == 'sequential':
+                batch_sampler = torch.utils.data.SequentialSampler(dataset)
             else:
                 raise ValueError('cfg.data.dataloader_type must be "single" or "cyclic"')
         else:
             raise ValueError('cfg.data.dataloader_type not found. Must be "single" or "cyclic"')
 
         collate_func = DataCollatorForSupervisedDataset(self.cfg, self.tokenizer)
-        return torch.utils.data.DataLoader(
+        return NevaDataloader(
             dataset,
             batch_sampler=batch_sampler,
             collate_fn=collate_func,
@@ -1192,6 +1281,18 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                     parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                     self.model[i].module.load_state_dict(checkpoint[f'model{i}'], strict=True)
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+
+        """
+        A hack fix of a pytorch-lightning bug:
+        https://github.com/Lightning-AI/pytorch-lightning/issues/18060
+        """
+        if 'loops' in checkpoint.keys():
+            checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['total']['completed'] = \
+                checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['total']['processed']
+            checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['completed'] = \
+                checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['processed']
+            checkpoint['loops']['fit_loop']['epoch_loop.state_dict']['_batches_that_stepped'] = \
+                checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['processed']
 
     def sharded_state_dict(self, prefix: str = ''):
         if self.use_peft:

@@ -1,30 +1,31 @@
-name: nemo_neva
+name: nemo_llava
 restore_from_path: null # used when starting from a .nemo file
 
 trainer:
-  devices: 1
+  devices: 8
   num_nodes: 1
   accelerator: gpu
   precision: bf16
   logger: False # logger provided by exp_manager
   enable_checkpointing: False
   use_distributed_sampler: False
-  max_epochs: -1 # PTL default. In practice, max_steps will be reached first.
-  max_steps: 4650 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
-  log_every_n_steps: 10
-  val_check_interval: 100
-  check_val_every_n_epoch: null
-  limit_val_batches: 50
-  limit_test_batches: 500
+  max_epochs: 1 # PTL default. In practice, max_steps will be reached first.
+  max_steps: -1 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
+  log_every_n_steps: 1
+  val_check_interval: 500
+  check_val_every_n_epoch: -1
+  limit_val_batches: 0.0
+  limit_test_batches: 0.0
   accumulate_grad_batches: 1 # do not modify, grad acc is automatic for training megatron models
   gradient_clip_val: 1.0
   benchmark: False
   enable_model_summary: False # default PTL callback for this does not support model parallelism, instead we log manually
+  num_sanity_val_steps: 0
 
 exp_manager:
   explicit_log_dir: null
   exp_dir: null
-  name: nemo_neva
+  name: llava_7b_pretrain_tp1_pp1
   create_wandb_logger: False
   wandb_logger_kwargs:
     project: null
@@ -34,12 +35,16 @@ exp_manager:
   resume_from_checkpoint: ${model.resume_from_checkpoint}
   create_checkpoint_callback: True
   checkpoint_callback_params:
-    monitor: val_loss
-    save_top_k: 10
-    mode: min
+    monitor: step
+    verbose: True
+    save_top_k: 5
+    mode: max
+    every_n_train_steps: 2500
+    every_n_epochs: 0
+    save_on_train_epoch_end: True
     always_save_nemo: False # saves nemo file during validation, not implemented for model parallel
-    save_nemo_on_train_end: False # not recommended when training large models on clusters with short time limits
-    filename: 'megatron_clip--{val_loss:.2f}-{step}-{consumed_samples}'
+    save_nemo_on_train_end: True # not recommended when training large models on clusters with short time limits
+    filename: 'llava-pretrain-{step}-{consumed_samples}'
     model_parallel_size: ${multiply:${model.tensor_model_parallel_size}, ${model.pipeline_model_parallel_size}}
   ema:
     enable: False
@@ -55,9 +60,9 @@ model:
   # gradient accumulation will be done automatically based on data_parallel_size
 
   # Batch size guideline for different types of dataset
-  micro_batch_size: 16 # limited by GPU memory
-  global_batch_size: 128 # will use more micro batches to reach global batch size
-
+  micro_batch_size: 2 # limited by GPU memory
+  global_batch_size: 256 # will use more micro batches to reach global batch size
+  mega_batch_mult: 50
   tensor_model_parallel_size: 1 # intra-layer model parallelism
   pipeline_model_parallel_size: 1 # inter-layer model parallelism
   virtual_pipeline_model_parallel_size: null # interleaved pipeline
@@ -67,45 +72,47 @@ model:
   # Multimodal configs
   mm_cfg:
     llm:
-      from_pretrained: null # path to nemo checkpoint
+      from_pretrained:  # path to nemo checkpoint
       freeze: True
-      model_type: llama_2 # `nvgpt` or `llama_2` supported
+      model_type: llama_2 # Only support nvgpt or llama_2
     vision_encoder:
-      from_pretrained: "" # path or name
+      from_pretrained:  # path or name
       from_hf: True
       patch_dim: 14
-      crop_size: [224, 224]
       hidden_size: 1024 # could be found from model but tricky in code
       vision_select_layer: -2   # default to the last layer
       class_token_length: 1
       freeze: True
+      vision_encoder_lr_ratio: 0.1
     pretrain_mm_mlp_adapter: null # path to pretrained mm adapter
-    mm_mlp_adapter_type: linear
+    mm_mlp_adapter_type: mlp2x_gelu
     use_im_start_end: False
+    use_image_tile: False
 
 
   # LLM configs
   # use GPTModel from megatron.core
-  mcore_gpt: False
+  mcore_gpt: True
 
   # model architecture
-  encoder_seq_length: 4096
+  encoder_seq_length: 2048
   max_position_embeddings: ${.encoder_seq_length}
   position_embedding_type: rope
-  num_layers: 40
-  hidden_size: 5120
-  ffn_hidden_size: 13824 # Transformer FFN hidden size. Usually 4 * hidden_size.
-  num_attention_heads: 40
+  num_layers: 32
+  hidden_size: 4096
+  ffn_hidden_size: 11008 # Transformer FFN hidden size. Usually 4 * hidden_size.
+  num_attention_heads: 32
   init_method_std: 0.014 # Standard deviation of the zero mean normal distribution used for weight initialization.')
   use_scaled_init_method: True # use scaled residuals initialization
   hidden_dropout: 0.0 # Dropout probability for hidden state transformer.
   attention_dropout: 0.0 # Dropout probability for attention
   ffn_dropout: 0.0 # Dropout probability in the feed-forward layer.
   kv_channels: null # Projection weights dimension in multi-head attention. Set to hidden_size // num_attention_heads if null
-  apply_query_key_layer_scaling: True # scale Q * K^T by 1 / layer-number.
-  normalization: rmsnorm # Type of normalization layers
+  apply_query_key_layer_scaling: False # scale Q * K^T by 1 / layer-number.
+  normalization: 'rmsnorm' # Normalization layer to use. Options are 'layernorm', 'rmsnorm'
   layernorm_epsilon: 1e-5
   do_layer_norm_weight_decay: False # True means weight decay on all params
+  make_vocab_size_divisible_by: 128 # Pad the vocab size to be divisible by this value for computation efficiency.
   pre_process: True # add embedding
   post_process: True # add pooler
   persist_layer_norm: True # Use of persistent fused layer norm kernel.
@@ -149,7 +156,7 @@ model:
   bias_activation_fusion: False
   megatron_legacy: False
 
-  transformer_engine: False
+  transformer_engine: True
   fp8: False # enables fp8 in TransformerLayer forward
   fp8_e4m3: False # sets fp8_format = recipe.Format.E4M3
   fp8_hybrid: False # sets fp8_format = recipe.Format.HYBRID
@@ -172,9 +179,9 @@ model:
   gradient_as_bucket_view: True # PyTorch DDP argument. Allocate gradients in a contiguous bucket to save memory (less fragmentation and buffer memory)
 
   tokenizer:
-    library: 'sentencepiece'
-    type: null
-    model: null
+    library: 'huggingface'
+    type: 
+    model: null # /path/to/tokenizer.model
     vocab_file: null
     merge_file: null
     delimiter: null # only used for tabular tokenizer
@@ -182,17 +189,18 @@ model:
     additional_special_tokens: null # ["<extra_id_0>", "<extra_id_1>", "<extra_id_2>", "<extra_id_3>", "<extra_id_4>", "<extra_id_5>"]
 
   data:
-    packed_sequence: False
     num_workers: 8
     dataloader_type: cyclic
-    data_path:
+    data_path: 
+    image_folder: 
     lazy_preprocess: True
     is_multimodal: True
-    media_type: image # currently supported: image
     sep_image_conv_front: False
-    conv_template: ${model.mm_cfg.llm.model_type} # check `nemo/collections/multimodal/data/neva/conversation.py`
-    image_folder: null
+    image_token_len: 576
+    conv_template: plain # check `nemo/collections/multimodal/data/neva/conversation.py`
     image_aspect_ratio: 'square'
+    crop_size: [336, 336]
+    image_size: [336, 336]
 
   # Nsys profiling options
   nsys_profile:
@@ -204,13 +212,13 @@ model:
 
   optim:
     name: fused_adam
-    lr: 2e-3
+    lr: 1e-3
     weight_decay: 0.
     betas:
       - 0.9
-      - 0.95
+      - 0.999
     sched:
       name: CosineAnnealing
-      warmup_steps: 140
+      warmup_steps: 66
       constant_steps: 0
-      min_lr: 2e-5
+      min_lr: 0

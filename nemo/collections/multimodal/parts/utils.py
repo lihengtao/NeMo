@@ -22,7 +22,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from PIL import Image
 from pytorch_lightning import Trainer
 from pytorch_lightning.plugins.environments import TorchElasticEnvironment
-from transformers import CLIPImageProcessor, SiglipImageProcessor
+from transformers import CLIPImageProcessor, SiglipImageProcessor, AutoImageProcessor
 from nemo.collections.multimodal.data.clip.augmentations.augmentations import image_transform
 
 from nemo.collections.multimodal.data.neva.neva_dataset import process_image
@@ -369,12 +369,19 @@ def create_neva_model_and_processor(cfg):
             neva_cfg.activations_checkpoint_granularity = None
             neva_cfg.activations_checkpoint_method = None
             neva_cfg.precision = trainer.precision
-            neva_cfg.mm_cfg.llm.from_pretrained = cfg.get('base_model_file', None)
             neva_cfg.apply_rope_fusion = False
             neva_cfg.fp8 = False
             neva_cfg.tensor_model_parallel_size = cfg.tensor_model_parallel_size
             neva_cfg.pipeline_model_parallel_size = cfg.pipeline_model_parallel_size
-        #    neva_cfg.mm_cfg.vision_encoder.from_pretrained = None
+            neva_cfg.mm_cfg.llm.from_pretrained = cfg.get('base_model_file', None) \
+                if cfg.get('base_model_file', None) else neva_cfg.mm_cfg.llm.from_pretrained
+            neva_cfg.mm_cfg.vision_encoder.from_pretrained = cfg.get('vision_encoder_path', None) \
+                if cfg.get('vision_encoder_path', None) else neva_cfg.mm_cfg.vision_encoder.from_pretrained
+            neva_cfg.mm_cfg.pretrain_mm_mlp_adapter = None
+            neva_cfg.tokenizer.type = cfg.get('tokenizer_type', None) \
+                if cfg.get('tokenizer_type', None) else neva_cfg.tokenizer.type
+            neva_cfg.tokenizer.model = cfg.get('tokenizer_model', None) \
+                if cfg.get('tokenizer_model', None) else neva_cfg.tokenizer.model
 
         model = MegatronNevaModel.restore_from(
             restore_path=cfg.neva_model_file,
@@ -471,13 +478,21 @@ def create_neva_model_and_processor(cfg):
             frames = maybe_video_path
 
         if neva_cfg.mm_cfg.vision_encoder.from_hf:
-            processor = CLIPImageProcessor.from_pretrained(
+            processor = AutoImageProcessor.from_pretrained(
                 neva_cfg.mm_cfg.vision_encoder.from_pretrained, torch_dtype=torch.bfloat16
             )
         else:
             processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.bfloat16)
 
-        # support single video inference
+        processor.crop_size = dict(
+            height=neva_cfg['data']['crop_size'][0],
+            width=neva_cfg['data']['crop_size'][1]
+        )
+        processor.size = dict(
+            height=neva_cfg['data']['image_size'][0],
+            width=neva_cfg['data']['image_size'][1]
+        )
+
         if neva_cfg.data.image_aspect_ratio == 'keep':
             max_hw, min_hw = max(frames.size), min(frames.size)
             aspect_ratio = max_hw / min_hw
@@ -501,7 +516,7 @@ def create_neva_model_and_processor(cfg):
                     result.paste(pil_img, ((height - width) // 2, 0))
                     return result
 
-            frames = expand2square(frames, tuple(int(x * 255) for x in processor.image_mean))
+            frames = expand2square(frames, tuple(int(0 * 255) for x in processor.image_mean))
             frames = processor.preprocess(frames, return_tensors='pt')['pixel_values']
         else:
             frames = processor.preprocess(frames, return_tensors='pt')['pixel_values']
@@ -526,12 +541,6 @@ def create_image_processor(mm_cfg):
             raise (ValueError("Currently only support CLIPImageProcessor and SiglipImageProcessor from Huggingface"))
 
         crop_size = mm_cfg.vision_encoder.get("crop_size", (224, 224))
-        if hasattr(image_processor, 'crop_size'):
-            assert crop_size == (
-                image_processor.crop_size['height'],
-                image_processor.crop_size['width'],
-            ), f"Crop size {crop_size} does not match the HuggingFace CLIP model's crop size {(image_processor.crop_size['height'], image_processor.crop_size['width'])}"
-
     else:
         # Corresponds to MegatronCLIPModel
         crop_size = mm_cfg.get("crop_size", (224, 224))

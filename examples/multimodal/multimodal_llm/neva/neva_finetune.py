@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
@@ -22,10 +23,11 @@ from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 
-mp.set_start_method("spawn", force=True)
+mp.set_start_method("fork", force=True)
 
+config_name = os.environ['NEMO_CONFIG']
 
-@hydra_runner(config_path="conf", config_name="neva_finetune")
+@hydra_runner(config_path="conf", config_name=config_name)
 def main(cfg) -> None:
     logging.info("\n\n************** Experiment configuration ***********")
     logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
