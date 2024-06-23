@@ -1103,10 +1103,7 @@ class LazySupervisedDataset(Dataset):
 
         # image exist in the data
         if self.multimodal_cfg['is_multimodal']:
-            if isinstance(self.processor, CLIPImageProcessor):
-                crop_size = [self.processor.crop_size['height'], self.processor.crop_size['width']]
-            else:
-                crop_size = self.multimodal_cfg['crop_size']
+            crop_size = self.multimodal_cfg['crop_size']
 
             # Image does not exist in the data, but the model is multimodal
             # TODO, if there are different videos on T dimensions.
@@ -1304,7 +1301,7 @@ def make_supervised_data_module(tokenizer, image_processor, model_cfg) -> Dict:
     add_extra_token = 1
     if getattr(model_cfg, 'no_seqlen_plus_one_input_tokens', False):
         add_extra_token = 0
-    crop_size = mm_cfg.vision_encoder.get("crop_size", (224, 224))
+    crop_size = data_cfg.get("crop_size", (224, 224))
 
     train_dataset = NevaDataset(
         tokenizer=tokenizer,
