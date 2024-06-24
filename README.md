@@ -48,6 +48,14 @@ pip install megatron-core decord
 pip install -U Pillow
 ```
 
+# HF model to NeMo model
+
+```
+python scripts/checkpoint_converters/convert_llama_hf_to_nemo.py \
+    --input_name_or_path checkpoints/vicuna-7b-v1.5 \
+    --output_path checkpoints/vicuna-7b-v1.5.nemo
+```
+
 # Pretrain
 
 ```
