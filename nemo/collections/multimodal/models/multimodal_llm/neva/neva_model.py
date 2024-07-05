@@ -46,7 +46,10 @@ from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters imp
     AdapterName,
     MultimodalProjectorAdapterConfig,
 )
-from nemo.collections.nlp.modules.common.megatron.utils import average_losses_across_data_parallel_group
+from nemo.collections.nlp.modules.common.megatron.utils import (
+    average_losses_across_data_parallel_group,
+    get_iterator_k_split,
+)
 from nemo.collections.nlp.modules.common.text_generation_utils import (
     generate,
     get_computeprob_response,
@@ -837,7 +840,7 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                 return loss_for_ub, dict(avg=reduced_loss[0].unsqueeze(0))
 
         def fwd_output_and_loss_func(dataloader_iter, model, checkpoint_activations_all_layers=None):
-            batch, _, _ = next(dataloader_iter)
+            batch = next(dataloader_iter)
             if isinstance(batch, tuple):
                 batch = batch
             if parallel_state.get_pipeline_model_parallel_world_size() == 1:

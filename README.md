@@ -56,6 +56,8 @@ python scripts/checkpoint_converters/convert_llama_hf_to_nemo.py \
     --output_path checkpoints/vicuna-7b-v1.5.nemo
 ```
 
+除模型的转换外，还需要tokenizer的转换。NeMo在词表额外添加了几个`<extra_xx>`。sentencepiece格式的用脚本转换，huggingface格式的需要手动添加。
+
 # Pretrain
 
 ```
@@ -138,6 +140,12 @@ python examples/multimodal/multimodal_llm/neva/neva_finetune.py \
     model.activations_checkpoint_num_layers=1 \
     exp_manager.name=llava_vicuna_7b_clip_finetune_tp4_pp1
 ```
+
+# TP和PP
+
+在训练时，可以指定`model.tensor_model_parallel_size`和`model.tensor_model_parallel_size`参数来改变TP和PP的设置。目前PP的策略是vision_encoder和word_embedding放在rank0，Transformer blocks均分到各个rank（`megatron/core/transformer/transformer_block.py`的33行）。
+
+使用TP或PP时，框架会自动将`vicuna-7b-v1.5-mcore.nemo`按需要切分，无需手动转换模型权重。但Pretrain阶段和SFT阶段的TP和PP需要一致，否则可能需要转换权重。
 
 # Inference
 
