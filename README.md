@@ -141,6 +141,17 @@ python examples/multimodal/multimodal_llm/neva/neva_finetune.py \
     exp_manager.name=llava_vicuna_7b_clip_finetune_tp4_pp1
 ```
 
+# FSDP
+FSDP通过以下的参数控制，在config.yaml里修改以使用
+```
+  # FSDP
+  fsdp: True # Enable training with torch FSDP.
+  fsdp_sharding_strategy: 'full' # Method to shard model states. Available options are 'full', 'hybrid', and 'grad'.
+  fsdp_grad_reduce_dtype: '32' # Gradient reduction data type.
+  fsdp_sharded_checkpoint: True # Store and load FSDP shared checkpoint.
+  fsdp_use_orig_params: True # Set to True to use FSDP for specific peft scheme.
+```
+
 # TP和PP
 
 在训练时，可以指定`model.tensor_model_parallel_size`和`model.tensor_model_parallel_size`参数来改变TP和PP的设置。目前PP的策略是vision_encoder和word_embedding放在rank0，Transformer blocks均分到各个rank（`megatron/core/transformer/transformer_block.py`的33行）。

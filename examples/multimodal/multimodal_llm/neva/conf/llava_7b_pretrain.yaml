@@ -56,6 +56,13 @@ exp_manager:
 model:
   precision: ${trainer.precision}
 
+  # FSDP
+  fsdp: True # Enable training with torch FSDP.
+  fsdp_sharding_strategy: 'full' # Method to shard model states. Available options are 'full', 'hybrid', and 'grad'.
+  fsdp_grad_reduce_dtype: '32' # Gradient reduction data type.
+  fsdp_sharded_checkpoint: True # Store and load FSDP shared checkpoint.
+  fsdp_use_orig_params: True # Set to True to use FSDP for specific peft scheme.
+  
   # specify micro_batch_size, global_batch_size, and model parallelism
   # gradient accumulation will be done automatically based on data_parallel_size
 
