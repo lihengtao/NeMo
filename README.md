@@ -97,6 +97,20 @@ python examples/multimodal/multimodal_llm/neva/neva_finetune.py \
     exp_manager.name=llava_vicuna_7b_clip_pretrain_tp4_pp1
 ```
 
+多节点训练时，`MASTER_ADDR`设为主节点地址，`WORLD_SIZE`设为总GPU数，`NODE_RANK`设置为节点的RANK。例如双节点训练时设置为
+
+```
+# 节点0
+export MASTER_ADDR=10.205.23.131
+export WORLD_SIZE=16
+export NODE_RANK=0
+
+# 节点1
+export MASTER_ADDR=10.205.23.131
+export WORLD_SIZE=16
+export NODE_RANK=1
+```
+
 # SFT
 
 ```
